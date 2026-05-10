@@ -1,0 +1,28 @@
+# Environment — never commit real credentials
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Tests & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+logs/
+*.log
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code project state
+.claude/
