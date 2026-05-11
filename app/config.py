@@ -36,8 +36,11 @@ class Settings(BaseSettings):
     binance_api_key: str = ""
     binance_api_secret: str = ""
 
-    # ── Binance Futures (global — public data) ─────────────────────────────────
+    # ── Binance Futures (global — public data, used for mark price / klines / L/S ratio / taker vol) ──
     binance_futures_base_url: str = "https://fapi.binance.com"
+
+    # ── OKX (used for OI, funding rates, liquidations — US-accessible alternative) ──
+    okx_base_url: str = "https://www.okx.com/api"
 
     # ── Scheduler intervals (seconds) ─────────────────────────────────────────
     scheduler_enabled: bool = True

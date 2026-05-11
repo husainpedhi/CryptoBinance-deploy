@@ -1,6 +1,16 @@
-"""Basic smoke tests for the Binance service layer."""
+"""Basic smoke tests for the Binance/OKX service layer."""
 
-from app.services.binance_service import _parse_ticker, _parse_kline, _parse_trade
+from app.services.binance_service import (
+    _from_okx_instid,
+    _parse_funding_rate,
+    _parse_kline,
+    _parse_liquidation,
+    _parse_oi_hist,
+    _parse_ticker,
+    _parse_trade,
+    _to_okx_ccy,
+    _to_okx_instid,
+)
 
 
 def test_parse_ticker():
@@ -57,3 +67,49 @@ def test_parse_trade():
     assert result["symbol"] == "BTCUSDT"
     assert result["trade_id"] == 987654321
     assert result["is_buyer_maker"] is True
+
+
+# ─── OKX symbol helpers ───────────────────────────────────────────────────────
+
+def test_okx_symbol_conversion():
+    assert _to_okx_instid("BTCUSDT") == "BTC-USDT-SWAP"
+    assert _to_okx_instid("MATICUSDT") == "POL-USDT-SWAP"
+    assert _from_okx_instid("BTC-USDT-SWAP") == "BTCUSDT"
+    assert _from_okx_instid("POL-USDT-SWAP") == "MATICUSDT"
+    assert _to_okx_ccy("BTCUSDT") == "BTC"
+    assert _to_okx_ccy("MATICUSDT") == "POL"
+
+
+# ─── OKX futures parsers ──────────────────────────────────────────────────────
+
+def test_parse_funding_rate_okx():
+    raw = {"instId": "BTC-USDT-SWAP", "fundingRate": "0.00010000",
+           "fundingTime": "1700000000000", "realizedRate": "0.00009500"}
+    result = _parse_funding_rate("BTCUSDT", raw)
+    assert result["symbol"] == "BTCUSDT"
+    assert result["funding_rate"] == "0.00009500"   # realizedRate, not fundingRate
+    assert result["funding_time"] is not None
+    assert result["mark_price"] is None
+
+
+def test_parse_oi_hist_okx():
+    row = ["1700000000000", "3553025249.54", "27610940.97"]  # [ts, oi_usd, vol_usd]
+    result = _parse_oi_hist("BTCUSDT", "5m", row)
+    assert result["symbol"] == "BTCUSDT"
+    assert result["period"] == "5m"
+    assert result["sum_open_interest"] == "3553025249.54"
+    assert result["sum_open_interest_value"] is None
+    assert result["timestamp"] is not None
+
+
+def test_parse_liquidation_okx():
+    detail = {"side": "buy", "sz": "0.001", "bkPx": "83000.00",
+              "posSide": "short", "ts": "1700000000000"}
+    result = _parse_liquidation("BTCUSDT", detail)
+    assert result["symbol"] == "BTCUSDT"
+    assert result["side"] == "BUY"
+    assert result["orig_qty"] == "0.001"
+    assert result["price"] == "83000.00"
+    assert result["avg_price"] == "83000.00"
+    assert result["trade_time"] is not None
+    assert result["order_type"] is None

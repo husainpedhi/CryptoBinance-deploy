@@ -1,4 +1,9 @@
-"""Binance data service — spot via python-binance Client, futures via direct requests."""
+"""Binance/OKX data service — spot via python-binance Client, futures via direct requests.
+
+Futures routing:
+  - Open interest, funding rates, liquidations → OKX V5 API (US-accessible)
+  - Mark price, OHLCV, long/short ratio, taker volume → Binance fapi (unchanged)
+"""
 
 from __future__ import annotations
 
@@ -14,7 +19,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from app.config import settings
 from app.utils.logger import get_logger
 
-# ─── Futures HTTP session (public endpoints, no auth) ────────────────────────
+# ─── Binance Futures HTTP session (mark price, klines, L/S ratio, taker vol) ─
 _FUTURES_SESSION = _requests.Session()
 _FUTURES_SESSION.headers.update({"Content-Type": "application/json"})
 
@@ -24,6 +29,49 @@ def _fapi(path: str, params: dict | None = None) -> Any:
     resp = _FUTURES_SESSION.get(url, params=params, timeout=10)
     resp.raise_for_status()
     return resp.json()
+
+
+# ─── OKX V5 HTTP session (OI, funding rates, liquidations) ───────────────────
+_OKX_SESSION = _requests.Session()
+_OKX_SESSION.headers.update({"Content-Type": "application/json"})
+
+# Symbols that Binance calls MATIC/etc. but OKX uses under a different ticker
+_OKX_BASE_RENAMES: dict[str, str] = {"MATIC": "POL"}
+_OKX_BASE_RENAMES_REV: dict[str, str] = {v: k for k, v in _OKX_BASE_RENAMES.items()}
+
+# Binance period notation → OKX rubik period values (5m / 1H / 1D only)
+_OKX_OI_PERIOD: dict[str, str] = {
+    "5m": "5m", "15m": "5m", "30m": "5m",
+    "1h": "1H", "4h": "1H", "1d": "1D",
+}
+
+
+def _okx(path: str, params: dict | None = None) -> list:
+    url = f"{settings.okx_base_url}{path}"
+    resp = _OKX_SESSION.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != "0":
+        raise ValueError(f"OKX API error {data.get('code')}: {data.get('msg')}")
+    return data["data"]
+
+
+def _to_okx_instid(symbol: str) -> str:
+    """BTCUSDT → BTC-USDT-SWAP, MATICUSDT → POL-USDT-SWAP"""
+    base = symbol.removesuffix("USDT")
+    return f"{_OKX_BASE_RENAMES.get(base, base)}-USDT-SWAP"
+
+
+def _from_okx_instid(instid: str) -> str:
+    """BTC-USDT-SWAP → BTCUSDT, POL-USDT-SWAP → MATICUSDT"""
+    base = instid.split("-")[0]
+    return f"{_OKX_BASE_RENAMES_REV.get(base, base)}USDT"
+
+
+def _to_okx_ccy(symbol: str) -> str:
+    """BTCUSDT → BTC (for rubik/underlying params), MATICUSDT → POL"""
+    base = symbol.removesuffix("USDT")
+    return _OKX_BASE_RENAMES.get(base, base)
 
 logger = get_logger(__name__)
 
@@ -273,56 +321,66 @@ def fetch_order_book_depth(symbol: str, limit: int = 20) -> list[dict]:
 # FUTURES (USD-M) — direct requests to fapi.binance.com (public, no auth)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ─── Funding Rates ────────────────────────────────────────────────────────────
+# ─── Funding Rates (OKX) ─────────────────────────────────────────────────────
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
 def fetch_funding_rates(symbol: str, limit: int = 100) -> list[dict]:
-    """Historical funding rates for a futures symbol (paid every 8 hours)."""
+    """Historical funding rates for a futures symbol via OKX."""
     logger.debug("Fetching funding rates symbol=%s", symbol)
-    rows = _fapi("/fapi/v1/fundingRate", {"symbol": symbol, "limit": limit})
-    return [_parse_funding_rate(r) for r in rows]
+    data = _okx("/v5/public/funding-rate-history",
+                {"instId": _to_okx_instid(symbol), "limit": min(limit, 100)})
+    return [_parse_funding_rate(symbol, r) for r in data]
 
 
-def _parse_funding_rate(raw: dict) -> dict:
+def _parse_funding_rate(symbol: str, raw: dict) -> dict:
     return {
-        "symbol": raw["symbol"],
+        "symbol": symbol,
         "funding_time": _ts(int(raw["fundingTime"])),
-        "funding_rate": raw["fundingRate"],
-        "mark_price": raw.get("markPrice"),
+        "funding_rate": raw["realizedRate"],  # actual settled rate
+        "mark_price": None,
     }
 
 
-# ─── Open Interest (current) ──────────────────────────────────────────────────
+# ─── Open Interest — current snapshot (OKX) ──────────────────────────────────
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
 def fetch_open_interest(symbol: str) -> dict:
-    """Current open interest for a futures symbol."""
+    """Latest open interest snapshot for a futures symbol via OKX."""
     logger.debug("Fetching open interest symbol=%s", symbol)
-    raw = _fapi("/fapi/v1/openInterest", {"symbol": symbol})
+    data = _okx("/v5/public/open-interest",
+                {"instType": "SWAP", "instId": _to_okx_instid(symbol)})
+    if not data:
+        raise ValueError(f"No open interest data returned for {symbol}")
     return {
-        "symbol": raw["symbol"],
-        "open_interest": raw["openInterest"],
+        "symbol": symbol,
+        "open_interest": data[0]["oiCcy"],  # OI in base currency (coins)
     }
 
 
-# ─── Open Interest History ────────────────────────────────────────────────────
+# ─── Open Interest History (OKX) ──────────────────────────────────────────────
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
 def fetch_open_interest_hist(symbol: str, period: str = "5m", limit: int = 30) -> list[dict]:
-    """Historical OI aggregated by period from Binance futures data endpoint."""
+    """Historical OI via OKX rubik stats endpoint.
+
+    OKX periods: 5m / 1H / 1D only — _OKX_OI_PERIOD maps finer Binance periods
+    to the nearest supported value. Values are USD-denominated (rubik aggregates
+    all contracts for the base currency; sumOpenInterestValue stored as None).
+    """
     logger.debug("Fetching OI hist symbol=%s period=%s", symbol, period)
-    rows = _fapi("/futures/data/openInterestHist",
-                 {"symbol": symbol, "period": period, "limit": limit})
-    return [_parse_oi_hist(r) for r in rows]
+    okx_period = _OKX_OI_PERIOD.get(period, "5m")
+    data = _okx("/v5/rubik/stat/contracts/open-interest-volume",
+                {"ccy": _to_okx_ccy(symbol), "period": okx_period, "limit": limit})
+    return [_parse_oi_hist(symbol, okx_period, row) for row in data]
 
 
-def _parse_oi_hist(raw: dict) -> dict:
+def _parse_oi_hist(symbol: str, period: str, row: list) -> dict:
     return {
-        "symbol": raw["symbol"],
-        "period": raw.get("period", ""),
-        "sum_open_interest": raw["sumOpenInterest"],
-        "sum_open_interest_value": raw["sumOpenInterestValue"],
-        "timestamp": _ts(int(raw["timestamp"])),
+        "symbol": symbol,
+        "period": period,
+        "sum_open_interest": row[1],  # USD-denominated OI (rubik only provides USD)
+        "sum_open_interest_value": None,
+        "timestamp": _ts(int(row[0])),
     }
 
 
@@ -433,27 +491,42 @@ def _parse_futures_kline(symbol: str, interval: str, row: list) -> dict:
     }
 
 
-# ─── Liquidations ─────────────────────────────────────────────────────────────
+# ─── Liquidations (OKX) ───────────────────────────────────────────────────────
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
 def fetch_liquidations(symbol: str, limit: int = 100) -> list[dict]:
-    """Historical forced liquidation orders for a futures symbol."""
+    """Recent forced liquidations for a futures symbol via OKX.
+
+    OKX groups fills at the same price into a details[] list per instrument;
+    we flatten to one row per fill. Binance-specific order fields are None.
+    """
     logger.debug("Fetching liquidations symbol=%s", symbol)
-    rows = _fapi("/fapi/v1/allForceOrders", {"symbol": symbol, "limit": limit})
-    return [_parse_liquidation(r) for r in rows]
+    ccy = _to_okx_ccy(symbol)
+    data = _okx("/v5/public/liquidation-orders",
+                {"instType": "SWAP", "uly": f"{ccy}-USDT",
+                 "state": "filled", "limit": min(limit, 100)})
+    results = []
+    for item in data:
+        if "instId" not in item:
+            # OKX uses {'$ref': '$.data[0]'} for repeated instrument entries — skip them
+            continue
+        inst_symbol = _from_okx_instid(item["instId"])
+        for detail in item.get("details", []):
+            results.append(_parse_liquidation(inst_symbol, detail))
+    return results
 
 
-def _parse_liquidation(raw: dict) -> dict:
+def _parse_liquidation(symbol: str, detail: dict) -> dict:
     return {
-        "symbol": raw["symbol"],
-        "side": raw["side"],
-        "order_type": raw.get("type"),
-        "time_in_force": raw.get("timeInForce"),
-        "orig_qty": raw.get("origQty"),
-        "price": raw.get("price"),
-        "avg_price": raw.get("averagePrice"),
-        "order_status": raw.get("status"),
-        "last_filled_qty": raw.get("lastFilledQty"),
-        "accumulated_qty": raw.get("accumulatedQty"),
-        "trade_time": _ts(int(raw["time"])),
+        "symbol": symbol,
+        "side": detail["side"].upper(),  # OKX: "buy"/"sell" → "BUY"/"SELL"
+        "order_type": None,
+        "time_in_force": None,
+        "orig_qty": detail["sz"],
+        "price": detail["bkPx"],         # bankruptcy price
+        "avg_price": detail["bkPx"],
+        "order_status": None,
+        "last_filled_qty": detail["sz"],
+        "accumulated_qty": None,
+        "trade_time": _ts(int(detail["ts"])),
     }
