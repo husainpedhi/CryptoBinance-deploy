@@ -1,8 +1,10 @@
-"""Binance/OKX data service — spot via python-binance Client, futures via direct requests.
+"""Binance/OKX data service — spot via python-binance Client, futures via OKX.
 
 Futures routing:
-  - Open interest, funding rates, liquidations → OKX V5 API (US-accessible)
-  - Mark price, OHLCV, long/short ratio, taker volume → Binance fapi (unchanged)
+  - All futures endpoints (open interest, funding rates, liquidations, mark
+    price, OHLCV, long/short ratio, taker volume) → OKX V5 API (US-accessible).
+    Binance's futures API (fapi.binance.com) returns HTTP 451 for US-based
+    requests, so none of the futures data can be sourced from it directly.
 """
 
 from __future__ import annotations
@@ -19,19 +21,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from app.config import settings
 from app.utils.logger import get_logger
 
-# ─── Binance Futures HTTP session (mark price, klines, L/S ratio, taker vol) ─
-_FUTURES_SESSION = _requests.Session()
-_FUTURES_SESSION.headers.update({"Content-Type": "application/json"})
-
-
-def _fapi(path: str, params: dict | None = None) -> Any:
-    url = f"{settings.binance_futures_base_url}{path}"
-    resp = _FUTURES_SESSION.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
-
-
-# ─── OKX V5 HTTP session (OI, funding rates, liquidations) ───────────────────
+# ─── OKX V5 HTTP session (all futures endpoints) ──────────────────────────────
 _OKX_SESSION = _requests.Session()
 _OKX_SESSION.headers.update({"Content-Type": "application/json"})
 
@@ -318,7 +308,7 @@ def fetch_order_book_depth(symbol: str, limit: int = 20) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FUTURES (USD-M) — direct requests to fapi.binance.com (public, no auth)
+# FUTURES (USD-M) — all via OKX V5 public API (fapi.binance.com is US geo-blocked)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ─── Funding Rates (OKX) ─────────────────────────────────────────────────────
@@ -384,110 +374,145 @@ def _parse_oi_hist(symbol: str, period: str, row: list) -> dict:
     }
 
 
-# ─── Long/Short Ratios ────────────────────────────────────────────────────────
+# ─── Long/Short Ratios (OKX) ──────────────────────────────────────────────────
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
 def fetch_long_short_ratio(symbol: str, ratio_type: str, period: str = "5m", limit: int = 30) -> list[dict]:
     """
-    Fetch long/short ratio history.
+    Fetch long/short ratio history via OKX.
+
     ratio_type: 'top_accounts' | 'top_positions' | 'global'
+    OKX's rubik stats only expose a single aggregate account long/short ratio
+    (no top-trader vs. all-trader breakdown like Binance), so all three
+    ratio_types are sourced from the same OKX series — top_accounts and
+    top_positions no longer diverge from global post-migration.
     """
-    path_map = {
-        "top_accounts": "/futures/data/topLongShortAccountRatio",
-        "top_positions": "/futures/data/topLongShortPositionRatio",
-        "global": "/futures/data/globalLongShortAccountRatio",
-    }
-    path = path_map[ratio_type]
     logger.debug("Fetching long/short ratio type=%s symbol=%s", ratio_type, symbol)
-    rows = _fapi(path, {"symbol": symbol, "period": period, "limit": limit})
-    return [_parse_ls_ratio(r, ratio_type) for r in rows]
+    okx_period = _OKX_OI_PERIOD.get(period, "5m")
+    data = _okx("/v5/rubik/stat/contracts/long-short-account-ratio-contract",
+                {"ccy": _to_okx_ccy(symbol), "period": okx_period, "limit": limit})
+    return [_parse_ls_ratio(symbol, ratio_type, okx_period, row) for row in data]
 
 
-def _parse_ls_ratio(raw: dict, ratio_type: str) -> dict:
-    if ratio_type == "top_positions":
-        long_r = raw.get("longPosition", raw.get("longAccount", "0"))
-        short_r = raw.get("shortPosition", raw.get("shortAccount", "0"))
-    else:
-        long_r = raw.get("longAccount", "0")
-        short_r = raw.get("shortAccount", "0")
+def _parse_ls_ratio(symbol: str, ratio_type: str, period: str, row: list) -> dict:
+    """row: [ts, longShortAccRatio]. Binance's separate long/short account
+    fractions are derived from OKX's single ratio (long + short == 1):
+    long = ratio / (1 + ratio), short = 1 / (1 + ratio)."""
+    ratio = Decimal(row[1])
+    long_r = ratio / (1 + ratio)
+    short_r = 1 / (1 + ratio)
     return {
-        "symbol": raw["symbol"],
+        "symbol": symbol,
         "ratio_type": ratio_type,
-        "period": raw.get("period", ""),
-        "long_ratio": long_r,
-        "short_ratio": short_r,
-        "long_short_ratio": raw.get("longShortRatio", "0"),
-        "timestamp": _ts(int(raw["timestamp"])),
+        "period": period,
+        "long_ratio": str(long_r),
+        "short_ratio": str(short_r),
+        "long_short_ratio": str(ratio),
+        "timestamp": _ts(int(row[0])),
     }
 
 
-# ─── Taker Buy/Sell Volume ────────────────────────────────────────────────────
+# ─── Taker Buy/Sell Volume (OKX) ──────────────────────────────────────────────
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
 def fetch_taker_volume(symbol: str, period: str = "5m", limit: int = 30) -> list[dict]:
-    """Taker buy vs sell volume — shows who is the aggressor."""
+    """Taker buy vs sell volume via OKX rubik stats — shows who is the aggressor.
+
+    OKX periods: 5m / 1H / 1D only — reuses _OKX_OI_PERIOD mapping.
+    """
     logger.debug("Fetching taker volume symbol=%s period=%s", symbol, period)
-    rows = _fapi("/futures/data/takerbuyVolume",
-                 {"symbol": symbol, "period": period, "limit": limit})
-    return [_parse_taker_vol(r, symbol) for r in rows]
+    okx_period = _OKX_OI_PERIOD.get(period, "5m")
+    data = _okx("/v5/rubik/stat/taker-volume",
+                {"ccy": _to_okx_ccy(symbol), "instType": "CONTRACTS",
+                 "period": okx_period, "limit": limit})
+    return [_parse_taker_vol(symbol, okx_period, row) for row in data]
 
 
-def _parse_taker_vol(raw: dict, symbol: str) -> dict:
+def _parse_taker_vol(symbol: str, period: str, row: list) -> dict:
+    """row: [ts, sellVol, buyVol]."""
+    sell_vol = Decimal(row[1])
+    buy_vol = Decimal(row[2])
     return {
         "symbol": symbol,
-        "period": raw.get("period", ""),
-        "buy_vol": raw["buySellRatio"] and raw["buyVol"],
-        "sell_vol": raw["sellVol"],
-        "buy_sell_ratio": raw.get("buySellRatio"),
-        "timestamp": _ts(int(raw["timestamp"])),
+        "period": period,
+        "buy_vol": str(buy_vol),
+        "sell_vol": str(sell_vol),
+        "buy_sell_ratio": str(buy_vol / sell_vol) if sell_vol else None,
+        "timestamp": _ts(int(row[0])),
     }
 
 
-# ─── Mark Price ───────────────────────────────────────────────────────────────
+# ─── Mark Price (OKX) ──────────────────────────────────────────────────────────
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
 def fetch_mark_price(symbol: str) -> dict:
-    """Mark price, index price and current funding rate for a futures symbol."""
+    """Mark price and current funding rate for a futures symbol via OKX."""
     logger.debug("Fetching mark price symbol=%s", symbol)
-    raw = _fapi("/fapi/v1/premiumIndex", {"symbol": symbol})
+    inst_id = _to_okx_instid(symbol)
+    mark_data = _okx("/v5/public/mark-price", {"instType": "SWAP", "instId": inst_id})
+    if not mark_data:
+        raise ValueError(f"No mark price data returned for {symbol}")
+    funding_data = _okx("/v5/public/funding-rate", {"instId": inst_id})
+    funding = funding_data[0] if funding_data else {}
     return {
-        "symbol": raw["symbol"],
-        "mark_price": raw["markPrice"],
-        "index_price": raw.get("indexPrice"),
-        "estimated_settle_price": raw.get("estimatedSettlePrice"),
-        "last_funding_rate": raw.get("lastFundingRate"),
-        "next_funding_time": _ts(raw.get("nextFundingTime")),
-        "interest_rate": raw.get("interestRate"),
+        "symbol": symbol,
+        "mark_price": mark_data[0]["markPx"],
+        "index_price": None,             # no OKX equivalent on this endpoint
+        "estimated_settle_price": None,  # perpetuals have no settlement — no OKX equivalent
+        "last_funding_rate": funding.get("fundingRate"),
+        "next_funding_time": _ts(int(funding["nextFundingTime"])) if funding.get("nextFundingTime") else None,
+        "interest_rate": None,           # no OKX equivalent exposed publicly
     }
 
 
-# ─── Futures OHLCV ────────────────────────────────────────────────────────────
+# ─── Futures OHLCV (OKX) ───────────────────────────────────────────────────────
+
+# Binance interval unit → OKX candle 'bar' duration, in milliseconds (for close_time)
+_MS_PER_UNIT: dict[str, int] = {"m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}
+
+
+def _to_okx_bar(interval: str) -> str:
+    """Binance interval notation → OKX candle 'bar' notation (uppercase unit, minutes/month unchanged)."""
+    unit = interval[-1]
+    return interval[:-1] + unit.upper() if unit in ("h", "d", "w") else interval
+
+
+def _interval_ms(interval: str) -> int:
+    """Approximate duration of a Binance-style interval string, in milliseconds."""
+    unit = interval[-1]
+    if unit == "M":  # calendar month — approximate as 30 days
+        return 30 * _MS_PER_UNIT["d"]
+    return int(interval[:-1]) * _MS_PER_UNIT[unit]
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
 def fetch_futures_klines(symbol: str, interval: str, limit: int = 100) -> list[dict]:
-    """Futures perpetual contract OHLCV candlestick data."""
+    """Futures perpetual contract OHLCV candlestick data via OKX."""
     logger.debug("Fetching futures klines symbol=%s interval=%s", symbol, interval)
-    rows = _fapi("/fapi/v1/klines",
-                 {"symbol": symbol, "interval": interval, "limit": limit})
+    rows = _okx("/v5/market/candles",
+                {"instId": _to_okx_instid(symbol), "bar": _to_okx_bar(interval), "limit": limit})
     return [_parse_futures_kline(symbol, interval, row) for row in rows]
 
 
 def _parse_futures_kline(symbol: str, interval: str, row: list) -> dict:
+    """row: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]. OKX candles carry
+    no trade count or taker buy/sell breakdown — those fields have no equivalent."""
+    open_time_ms = int(row[0])
     return {
         "symbol": symbol,
         "interval": interval,
-        "open_time": _ts(int(row[0])),
-        "close_time": _ts(int(row[6])),
+        "open_time": _ts(open_time_ms),
+        "close_time": _ts(open_time_ms + _interval_ms(interval) - 1),
         "open": row[1],
         "high": row[2],
         "low": row[3],
         "close": row[4],
         "volume": row[5],
         "quote_asset_volume": row[7],
-        "trade_count": int(row[8]),
-        "taker_buy_base_volume": row[9],
-        "taker_buy_quote_volume": row[10],
-        "kline_id": int(row[0]),
+        "trade_count": None,             # no OKX equivalent
+        "taker_buy_base_volume": None,   # no OKX equivalent
+        "taker_buy_quote_volume": None,  # no OKX equivalent
+        "kline_id": open_time_ms,
     }
 
 

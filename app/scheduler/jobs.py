@@ -139,15 +139,21 @@ def _do_fetch_open_interest_hist() -> int:
 
 def _do_fetch_long_short_ratios() -> int:
     total = 0
+    attempted = 0
+    failures = 0
     for symbol in settings.futures_symbols_list:
         for ratio_type in ("top_accounts", "top_positions", "global"):
+            attempted += 1
             try:
                 rows = binance_service.fetch_long_short_ratio(
                     symbol, ratio_type, period=settings.futures_period, limit=30)
                 with get_db() as session:
                     total += long_short_ratio_repo.upsert_long_short_ratios(session, rows)
             except Exception as exc:
+                failures += 1
                 logger.warning("L/S ratio %s/%s failed: %s", symbol, ratio_type, exc)
+    if attempted and failures == attempted:
+        raise RuntimeError(f"L/S ratio fetch failed for all {failures} symbol/type combination(s)")
     return total
 
 
@@ -161,12 +167,17 @@ def _do_fetch_taker_volume() -> int:
 
 
 def _do_fetch_mark_price() -> int:
+    symbols = settings.futures_symbols_list
     rows = []
-    for symbol in settings.futures_symbols_list:
+    failures = 0
+    for symbol in symbols:
         try:
             rows.append(binance_service.fetch_mark_price(symbol))
         except Exception as exc:
+            failures += 1
             logger.warning("Mark price fetch failed for %s: %s", symbol, exc)
+    if symbols and failures == len(symbols):
+        raise RuntimeError(f"Mark price fetch failed for all {failures} symbol(s)")
     if not rows:
         return 0
     with get_db() as session:
