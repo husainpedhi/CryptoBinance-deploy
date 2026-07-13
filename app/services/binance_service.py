@@ -390,7 +390,7 @@ def fetch_long_short_ratio(symbol: str, ratio_type: str, period: str = "5m", lim
     logger.debug("Fetching long/short ratio type=%s symbol=%s", ratio_type, symbol)
     okx_period = _OKX_OI_PERIOD.get(period, "5m")
     data = _okx("/v5/rubik/stat/contracts/long-short-account-ratio-contract",
-                {"ccy": _to_okx_ccy(symbol), "period": okx_period, "limit": limit})
+                {"instId": _to_okx_instid(symbol), "period": okx_period, "limit": limit})
     return [_parse_ls_ratio(symbol, ratio_type, okx_period, row) for row in data]
 
 

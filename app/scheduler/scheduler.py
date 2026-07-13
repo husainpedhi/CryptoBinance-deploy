@@ -1,5 +1,7 @@
 """APScheduler — interval-based jobs for all Binance spot and futures data feeds."""
 
+from datetime import datetime, timezone
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -41,6 +43,11 @@ _JOB_SPECS = [
 
 
 def _register_jobs(scheduler) -> None:
+    # IntervalTrigger's first fire is a full interval after registration, not
+    # immediate — so an hourly/15-min job never runs at all if the process gets
+    # restarted before it reaches that first checkpoint. Force an immediate
+    # first run for every job; the trigger takes over for subsequent runs.
+    now = datetime.now(timezone.utc)
     for fn, interval_attr, job_id, name in _JOB_SPECS:
         seconds = getattr(settings, interval_attr)
         scheduler.add_job(
@@ -50,6 +57,11 @@ def _register_jobs(scheduler) -> None:
             name=name,
             replace_existing=True,
             max_instances=1,
+            next_run_time=now,
+            # Default grace (1s) is too tight once several jobs share a
+            # next_run_time (e.g. the forced immediate first run above) —
+            # a late check silently drops the run instead of executing it.
+            misfire_grace_time=60,
         )
 
 
